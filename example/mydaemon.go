@@ -1,8 +1,6 @@
 package main
 
 import (
-	"time"
-
 	"github.com/nzions/baselog"
 	"github.com/nzions/daemon"
 )
@@ -19,38 +17,40 @@ type MyLittleDaemon struct {
 	Logger baselog.Logger
 }
 
-func (x *MyLittleDaemon) GetDaemonConfig() daemon.Config {
-	dc := daemon.NewConfig()
-	dc.EnableDrain = true
-	dc.Log = x.Logger
+func (x *MyLittleDaemon) GetConfigObject() *MyLittleDaemonConfig {
 
-	dc.ConfigFile = "./config.json"
-	x.Config = &MyLittleDaemonConfig{}
-	dc.ConfigObject = x.Config
-	return dc
+	if x.Config == nil {
+		x.Config = &MyLittleDaemonConfig{}
+	}
+	return x.Config
 }
 
 func (x *MyLittleDaemon) DaemonNewConfig() {
-	x.Logger.Logf("Got New Config %s", x.Config)
+	x.Logger.Logf("MyLittleDaemon Got New Config %s", x.Config)
 }
 
 func (x *MyLittleDaemon) DaemonStart() {
-	x.Logger.Log("Daemon Starting")
+	x.Logger.Log("MyLittleDaemon Starting")
 }
 
 func (x *MyLittleDaemon) DaemonDrain() {
-	x.Logger.Log("Daemon Draining....")
-	time.Sleep(5 * time.Second)
+	x.Logger.Log("MyLittleDaemon Draining....")
 }
 
 func (x *MyLittleDaemon) DaemonStop() {
-	x.Logger.Log("Daemon Stopping")
+	x.Logger.Log("MyLittleDaemon Stopping")
 }
 
 func main() {
-	mld := MyLittleDaemon{
-		Logger: &baselog.STDOutLog{},
+	logger := &baselog.STDOutLog{}
+	mld := &MyLittleDaemon{
+		Logger: logger,
 	}
-	mld.Daemonize(&mld)
-	mld.Run()
+	dmn := daemon.NewDefaultDaemon(mld)
+	dmn.Config.Log = logger
+	dmn.Config.EnableDrain = true
+	dmn.Config.ConfigFile = "./config.json"
+	dmn.Config.ConfigObject = mld.GetConfigObject()
+
+	dmn.Run()
 }

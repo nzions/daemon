@@ -19,12 +19,10 @@ import (
 // newconfig
 
 type DaemonObj interface {
-	GetDaemonConfig() Config
 	DaemonStart()
 	DaemonDrain()
 	DaemonStop()
 	DaemonNewConfig()
-	// DaemonAnnounce(*Daemon) error
 }
 
 type Helpers struct {
@@ -35,11 +33,8 @@ func (x *Helpers) Run() {
 	x.Daemon.Run()
 }
 
-func (x *Helpers) Daemonize(dObj DaemonObj) (err error) {
-	x.Daemon = &Daemon{
-		DaemonObj: dObj,
-	}
-	return nil
+func (x *Helpers) Stop() {
+	x.Daemon.Stop()
 }
 
 func (Helpers) DaemonDrain() {
@@ -52,12 +47,32 @@ func (Helpers) DaemonNewConfig() {
 	// don't forget to set ConfigFile and ConfigObject in Daemon Config
 }
 
-func NewConfig() Config {
+func New(config Config) (d *Daemon, err error) {
+	d = &Daemon{
+		Config:    config,
+		DaemonObj: config.DaemonObj,
+	}
+
+	if config.Log == nil {
+		return nil, fmt.Errorf("log cannot be nil")
+	}
+
+	return d, nil
+}
+
+func NewDefaultDaemon(obj DaemonObj) (d *Daemon) {
+	d, _ = New(NewDefaultConfig(obj))
+	return
+}
+
+func NewDefaultConfig(obj DaemonObj) Config {
 	return Config{
 		ConfigCheckInterval: time.Second * 5,
 		StartTimeout:        time.Second * 5,
 		DrainTimeout:        time.Second * 5,
 		ExitTimeout:         time.Millisecond * 500,
+		Log:                 &baselog.STDOutLog{},
+		DaemonObj:           obj,
 	}
 }
 
@@ -67,36 +82,30 @@ type Config struct {
 	Log                 baselog.Logger
 	ConfigCheckInterval time.Duration
 	EnableDrain         bool
+	NoExit              bool
 	StartTimeout        time.Duration
 	DrainTimeout        time.Duration
 	ExitTimeout         time.Duration
+	DaemonObj           DaemonObj
 }
 
 type Daemon struct {
 	DaemonObj DaemonObj
 	Config    Config
 
-	cfStat      os.FileInfo
-	keepRunning bool
-	exitSt      int
-	mtx         sync.RWMutex
-	wg          sync.WaitGroup
+	cfStat    os.FileInfo
+	isRunning bool
+	mtx       sync.RWMutex
+	runLock   sync.RWMutex
+	stopChan  chan int
 }
 
-// this belons in daemon
+// KeepRunning returns true if we are still running
 func (x *Daemon) KeepRunning() (kr bool) {
 	x.SyncDoRO(func() {
-		kr = x.keepRunning
+		kr = x.isRunning
 	})
 	return
-}
-
-func (x *Daemon) RequestExit(exitSt int) {
-	x.Config.Log.Debugf("exit requested")
-	x.SyncDoRW(func() {
-		x.keepRunning = false
-	})
-	x.wg.Done()
 }
 
 func (x *Daemon) DoWithTimeout(timeout time.Duration, f func()) bool {
@@ -116,45 +125,46 @@ func (x *Daemon) DoWithTimeout(timeout time.Duration, f func()) bool {
 
 // handleExit gets called on sigterm and sigint
 func (x *Daemon) handleExit() {
+	// set isrunning to false so helper goroutines can stop
+	x.SyncDoRW(func() {
+		x.isRunning = false
+	})
+
+	es := 0
 	if x.Config.EnableDrain {
 		x.SyncDoRW(func() {
 			x.Config.EnableDrain = false
 		})
-		x.DoWithTimeout(x.Config.DrainTimeout, x.DaemonObj.DaemonDrain)
+		if !x.DoWithTimeout(x.Config.DrainTimeout, x.DaemonObj.DaemonDrain) {
+			x.Config.Log.Errorf("Timed out waiting for Drain")
+		}
 	}
 
+	// call stop
 	if !x.DoWithTimeout(x.Config.ExitTimeout, x.DaemonObj.DaemonStop) {
-		x.Config.Log.Errorf("Timed out waiting for exit... hard exiting")
-		x.RequestExit(1)
-		return
+		x.Config.Log.Errorf("Timed out waiting for Stop")
 	}
 
-	if x.KeepRunning() {
-		x.Config.Log.Bugf("Exit not called, exiting manually")
-		x.RequestExit(1)
-		return
-
-	}
-	x.RequestExit(1)
+	// send stop to chan to unlock the Start thread
+	x.stopChan <- es
 }
 
 func (x *Daemon) sigHandler(c chan os.Signal) {
 	for sig := range c {
 		switch sig {
 		case syscall.SIGINT:
-			fmt.Println("SIGINT")
+			fmt.Println(" SIGINT")
 			go x.handleExit()
 		case syscall.SIGTERM:
-			fmt.Println("SIGTERM")
+			fmt.Println(" SIGTERM")
 			go x.handleExit()
 		case syscall.SIGHUP:
-			fmt.Println("SIGHUP")
+			fmt.Println(" SIGHUP - TODO handle")
 		}
 	}
 }
 
 func (x *Daemon) loadConfigFile() {
-
 	fStat, err := os.Stat(x.Config.ConfigFile)
 	if err != nil {
 		x.Config.Log.Errorf("Unable to Stat Config File: %s", err.Error())
@@ -187,6 +197,7 @@ func (x *Daemon) ConfigWatcher() {
 		x.loadConfigFile()
 		time.Sleep(x.Config.ConfigCheckInterval)
 	}
+	x.Config.Log.Tracef("ConfigWatcher stopped")
 }
 
 func (x *Daemon) SyncDoRO(f func()) {
@@ -201,31 +212,29 @@ func (x *Daemon) SyncDoRW(f func()) {
 	f()
 }
 
+func (x *Daemon) TryExit(es int) {
+	if !x.Config.NoExit {
+		os.Exit(es)
+	}
+}
+
 // RunForever
 func (x *Daemon) Run() {
-	// announce myself
-	// if err := x.DaemonObj.DaemonAnnounce(x); err != nil {
-	// 	x.Config.Log.Errorf("announce rejected %s", err)
-	// 	os.Exit(1)
-	// }
-
 	if x.KeepRunning() {
-		fmt.Println("Already running")
+		fmt.Println("Can't call Run again... Already running")
 		return
 	}
 
-	// get config
-	x.Config = x.DaemonObj.GetDaemonConfig()
+	// set the lock so other components can wait for us to finish
+	x.runLock.Lock()
 
+	// create the stop chan
+	x.stopChan = make(chan int)
+
+	// set state to running
 	x.SyncDoRW(func() {
-		x.keepRunning = true
+		x.isRunning = true
 	})
-
-	// ensure the logger isn't nil
-	if x.Config.Log == nil {
-		fmt.Println("Error no logger")
-		os.Exit(1)
-	}
 
 	// load config, then watch
 	if x.Config.ConfigFile != "" {
@@ -238,17 +247,28 @@ func (x *Daemon) Run() {
 	go x.sigHandler(c)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// start the daemon
-	x.Config.Log.Debugf("Daemon Started, PID %d", os.Getpid())
-
 	// start
 	if !x.DoWithTimeout(x.Config.StartTimeout, x.DaemonObj.DaemonStart) {
 		x.Config.Log.Errorf("Timout waiting for Start")
-		os.Exit(1)
+		x.TryExit(1)
+		return
 	}
 
+	x.Config.Log.Debugf("Daemon Started, PID %d", os.Getpid())
+
 	// now we wait
-	x.wg.Add(1)
-	x.wg.Wait()
-	os.Exit(x.exitSt)
+	ec := <-x.stopChan
+	x.Config.Log.Tracef("STOP recieved on stop chan Exit Code %d", ec)
+	x.TryExit(ec)
+}
+
+func (x *Daemon) WaitForStop() {
+	x.runLock.RLock()
+	defer x.runLock.RUnlock()
+}
+
+// requests a stop, blocks until daemon has stopped
+func (x *Daemon) Stop() {
+	x.handleExit()
+	x.WaitForStop()
 }
