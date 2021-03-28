@@ -13,11 +13,6 @@ import (
 	"github.com/nzions/baselog"
 )
 
-// start
-// stop
-// drain
-// newconfig
-
 type DaemonObj interface {
 	DaemonStart()
 	DaemonDrain()
