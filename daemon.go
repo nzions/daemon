@@ -156,6 +156,7 @@ func (x *Daemon) sigHandler(c chan os.Signal) {
 		case syscall.SIGHUP:
 			fmt.Println(" SIGHUP - TODO handle")
 		}
+
 	}
 }
 
